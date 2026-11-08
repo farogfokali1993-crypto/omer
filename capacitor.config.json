@@ -1,0 +1,11 @@
+{
+  "appId": "com.sqoor.gps",
+  "appName": "Zoom",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}
