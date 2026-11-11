@@ -1,0 +1,130 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: npm install
+
+      # التطبيق كله داخل www/ (index.html + vendor + assets + place-icons + maps + ...)
+      - name: Add Android platform (only if android/ is missing)
+        run: |
+          if [ ! -d android ]; then npx cap add android; fi
+
+      # اسم التطبيق Zoom وأيقونته (من الملف icons.zip في جذر المشروع)
+      - name: Apply app name and launcher icons
+        run: |
+          R=android/app/src/main/res
+          rm -rf /tmp/zoom-icons && mkdir -p /tmp/zoom-icons
+          unzip -q -o icons.zip -d /tmp/zoom-icons
+          cp -r /tmp/zoom-icons/android_res/* "$R"/
+          sed -i 's#<string name="app_name">.*</string>#<string name="app_name">Zoom</string>#; s#<string name="title_activity_main">.*</string>#<string name="title_activity_main">Zoom</string>#' "$R/values/strings.xml"
+
+      - name: Add permissions to AndroidManifest (once)
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          if ! grep -q "ACCESS_FINE_LOCATION" "$M"; then
+            sed -i 's#<application#<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>\n    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-feature android:name="android.hardware.location.gps" android:required="false"/>\n    <application#' "$M"
+          fi
+
+      # تسجيل التطبيق كتطبيق ملاحة: يظهر في قائمة «فتح باستخدام» عند الضغط على أي موقع
+      # (geo: / google.navigation: / روابط خرائط جوجل المرسلة في واتساب وغيره)
+      - name: Register as navigation app (geo / maps links)
+        run: |
+          python3 - <<'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          if 'android:scheme="geo"' not in s:
+              block = '''
+                  <!-- Zoom: تطبيق ملاحة وتحديد مسارات -->
+                  <intent-filter>
+                      <action android:name="android.intent.action.VIEW"/>
+                      <category android:name="android.intent.category.DEFAULT"/>
+                      <category android:name="android.intent.category.BROWSABLE"/>
+                      <data android:scheme="geo"/>
+                  </intent-filter>
+                  <intent-filter>
+                      <action android:name="android.intent.action.VIEW"/>
+                      <category android:name="android.intent.category.DEFAULT"/>
+                      <category android:name="android.intent.category.BROWSABLE"/>
+                      <data android:scheme="google.navigation"/>
+                  </intent-filter>
+                  <intent-filter>
+                      <action android:name="android.intent.action.VIEW"/>
+                      <category android:name="android.intent.category.DEFAULT"/>
+                      <category android:name="android.intent.category.BROWSABLE"/>
+                      <data android:scheme="https"/>
+                      <data android:scheme="http"/>
+                      <data android:host="maps.google.com"/>
+                      <data android:host="maps.app.goo.gl"/>
+                      <data android:host="maps.apple.com"/>
+                  </intent-filter>
+                  <intent-filter>
+                      <action android:name="android.intent.action.VIEW"/>
+                      <category android:name="android.intent.category.DEFAULT"/>
+                      <category android:name="android.intent.category.BROWSABLE"/>
+                      <data android:scheme="https"/>
+                      <data android:scheme="http"/>
+                      <data android:host="www.google.com"/>
+                      <data android:host="google.com"/>
+                      <data android:pathPrefix="/maps"/>
+                  </intent-filter>
+          '''
+              i = s.rfind('</activity>')
+              s = s[:i] + block + '    ' + s[i:]
+              if 'android:launchMode' not in s:
+                  s = s.replace('<activity', '<activity android:launchMode="singleTask"', 1)
+              open(p, 'w', encoding='utf-8').write(s)
+          PY
+
+      - name: Sync web files into Android
+        run: npx cap sync android
+
+      # --- توقيع الإصدار (Release) إن وُجدت الأسرار، وإلا نبني Debug ---
+      - name: Decode keystore
+        if: env.HAS_KEYSTORE == 'true'
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
+
+      - name: Build release APK
+        if: env.HAS_KEYSTORE == 'true'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=$PWD/app/release.keystore \
+            -Pandroid.injected.signing.store.password='${{ secrets.KEYSTORE_PASSWORD }}' \
+            -Pandroid.injected.signing.key.alias='${{ secrets.KEY_ALIAS }}' \
+            -Pandroid.injected.signing.key.password='${{ secrets.KEY_PASSWORD }}'
+
+      - name: Build debug APK
+        if: env.HAS_KEYSTORE != 'true'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqoor-gps-apk
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/apk/debug/*.apk
